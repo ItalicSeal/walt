@@ -185,6 +185,40 @@ pub fn rotation_service_status() -> Result<String> {
     ))
 }
 
+pub fn rotate_now() -> Result<()> {
+    let index = WallpaperIndex::new()?;
+    let config = Config::new();
+    let candidates = rotation_candidates(&index, &config);
+
+    if candidates.is_empty() {
+        bail!("No rotation wallpapers available. Add wallpapers to rotation or configure paths.");
+    }
+
+    let mut state = load_rotation_state()?;
+    if config.uses_same_wallpaper_on_all_displays_for_rotation() {
+        let next = next_wallpaper(&candidates, state.last_wallpaper.as_ref())
+            .cloned()
+            .context("Could not determine next rotation wallpaper")?;
+        set_wallpaper(&next.path.to_string_lossy())?;
+        state.last_wallpaper = Some(next.path.clone());
+        println!("Rotated wallpaper: {}", next.path.display());
+    } else {
+        let monitors = get_monitors();
+        let selection =
+            next_wallpaper_assignments(&monitors, &candidates, state.last_wallpaper.as_ref())
+                .context("Could not determine next rotation wallpapers")?;
+        set_wallpapers_for_monitors(&selection.assignments)?;
+        state.last_wallpaper = Some(selection.last_wallpaper);
+        println!("Rotated wallpapers across displays:");
+        for (monitor, path) in &selection.assignments {
+            println!("  {monitor} -> {}", path.display());
+        }
+    }
+    save_rotation_state(&state)?;
+
+    Ok(())
+}
+
 pub fn run_rotation_daemon() -> Result<()> {
     info!("starting Walt rotation daemon");
     let index = WallpaperIndex::new()?;

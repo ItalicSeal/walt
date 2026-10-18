@@ -12,8 +12,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 
-const ROTATION_OPTIONS: &str = "install, enable, disable, uninstall, status, interval";
-const ROTATION_USAGE: &str = "walt rotation <install|enable|disable|uninstall|status|interval>";
+const ROTATION_OPTIONS: &str = "install, enable, disable, uninstall, status, interval, rotate";
+const ROTATION_USAGE: &str =
+    "walt rotation <install|enable|disable|uninstall|status|interval|rotate>";
 const RANDOM_USAGE: &str = "walt random [--same|DISPLAY_INDEX]";
 const UNINSTALL_USAGE: &str = "walt uninstall [--yes]";
 
@@ -44,6 +45,7 @@ enum RotationCommand {
     Uninstall,
     Status,
     Interval(u64),
+    Rotate,
 }
 
 fn main() -> Result<()> {
@@ -116,6 +118,9 @@ fn main() -> Result<()> {
                     log::info!("set rotation interval seconds={seconds}");
                     println!("Rotation interval set to {}.", format_interval(seconds));
                 }
+                RotationCommand::Rotate => {
+                    backend::rotate_now()?;
+                }
             }
             return Ok(());
         }
@@ -150,6 +155,8 @@ fn parse_command(args: &[&str]) -> Result<CliCommand> {
         ["rotation", "interval", seconds] => Ok(CliCommand::Rotation(RotationCommand::Interval(
             parse_rotation_interval(seconds)?,
         ))),
+        ["rotate"] => Ok(CliCommand::Rotation(RotationCommand::Rotate)),
+
         ["rotation", action] => Ok(CliCommand::Rotation(parse_rotation_command(action)?)),
         ["rotation", _, ..] => bail!("Usage: {ROTATION_USAGE}"),
         ["--version"] | ["-v"] => Ok(CliCommand::Version),
@@ -167,6 +174,7 @@ fn parse_rotation_command(action: &str) -> Result<RotationCommand> {
         "uninstall" => Ok(RotationCommand::Uninstall),
         "status" => Ok(RotationCommand::Status),
         "interval" => bail!("Usage: walt rotation interval <seconds>"),
+        "rotate" => Ok(RotationCommand::Rotate),
         _ => bail!("Unknown rotation option: {action}"),
     }
 }
@@ -357,6 +365,7 @@ fn usage_text() -> String {
         "  rotation uninstall        Stop and remove the persistent rotation service",
         "  rotation status           Show formatted rotation service status, including activity",
         "  rotation interval <secs>  Set the rotation interval in seconds",
+        "  rotation rotate           Immediately rotate to the next wallpaper",
         "",
         "Examples:",
         "  walt gui",
@@ -367,7 +376,7 @@ fn usage_text() -> String {
         "  walt rotation install",
         "  walt rotation interval 900",
         "  walt rotation status",
-    ]
+        "  walt rotation rotate",    ]
     .join("\n")
 }
 
@@ -536,11 +545,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_rotation_rotate_command() {
+        assert_eq!(
+            parse_command(&["rotation", "rotate"]).expect("command"),
+            CliCommand::Rotation(RotationCommand::Rotate)
+        );
+    }
+
+    #[test]
     fn rejects_missing_rotation_option() {
         let error = parse_command(&["rotation"]).expect_err("missing option should fail");
         assert_eq!(
             error.to_string(),
-            "Missing rotation option. Valid options: install, enable, disable, uninstall, status, interval"
+            "Missing rotation option. Valid options: install, enable, disable, uninstall, status, interval, rotate"
         );
     }
 
@@ -580,7 +597,7 @@ mod tests {
             parse_command(&["rotation", "install", "extra"]).expect_err("extra args should fail");
         assert_eq!(
             error.to_string(),
-            "Usage: walt rotation <install|enable|disable|uninstall|status|interval>"
+            "Usage: walt rotation <install|enable|disable|uninstall|status|interval|rotate>"
         );
     }
 

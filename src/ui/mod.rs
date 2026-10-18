@@ -207,11 +207,14 @@ impl SortMode {
 struct PreviewRequest {
     request_id: u64,
     image_path: PathBuf,
+    is_already_rendered: bool,
+    prefetch_paths: Vec<PathBuf>,
     area: Rect,
 }
 
 struct PreviewResponse {
     request_id: u64,
+    image_path: PathBuf,
     protocol: anyhow::Result<StatefulProtocol>,
 }
 
@@ -313,6 +316,7 @@ pub struct App {
     preview_rx: Receiver<PreviewResponse>,
     prewarm_tx: Sender<Vec<PathBuf>>,
     current_image: Option<StatefulProtocol>,
+    preview_cache: HashMap<PathBuf, StatefulProtocol>,
     wallpaper_index: WallpaperIndex,
     index_request_id: u64,
     index_tx: Sender<IndexRequest>,
@@ -412,6 +416,7 @@ impl App {
             preview_rx,
             prewarm_tx,
             current_image: None,
+            preview_cache: HashMap::new(),
             wallpaper_index,
             index_request_id: 0,
             index_tx,
@@ -2023,6 +2028,7 @@ impl App {
                 let preview_area = self.themed_block(" Preview ", theme).inner(right_chunks[0]);
                 if preview_area != self.preview_area {
                     self.preview_area = preview_area;
+                    self.preview_cache.clear(); // Prunes old resolutions
                     self.request_preview_load();
                 }
                 self.render_library_sections(frame, main_chunks[0], theme);
@@ -3126,20 +3132,59 @@ impl App {
             return;
         }
         self.last_preview_target = Some(target);
-        self.current_image = None;
 
-        self.preview_request_id = self.preview_request_id.wrapping_add(1);
-        let _ = self.preview_tx.send(PreviewRequest {
-            request_id: self.preview_request_id,
-            image_path,
-            area: self.preview_area,
-        });
-
+        // Calculate above and below neighbor indices
         let indices = self.section_indices(self.active_section);
         let selected = self
             .section_state(self.active_section)
             .selected()
             .unwrap_or(0);
+
+        let mut prefetch_paths = Vec::new();
+        // Above (selected - 1)
+        if selected > 0 {
+            if let Some(idx) = indices.get(selected - 1) {
+                if let Some(wall) = self.wallpapers.get(*idx) {
+                    prefetch_paths.push(wall.path.clone());
+                }
+            }
+        }
+        // Below (selected + 1)
+        if selected + 1 < indices.len() {
+            if let Some(idx) = indices.get(selected + 1) {
+                if let Some(wall) = self.wallpapers.get(*idx) {
+                    prefetch_paths.push(wall.path.clone());
+                }
+            }
+        }
+
+        // Keep memory low: prune cached entries that aren't the current or neighbor images
+        let mut keep_paths: HashSet<PathBuf> = prefetch_paths.iter().cloned().collect();
+        keep_paths.insert(image_path.clone());
+        self.preview_cache.retain(|p, _| keep_paths.contains(p));
+
+        // INSTANT DISPLAY: Check if this image was already prefetched into cache
+        let is_already_rendered =
+            if let Some(cached_protocol) = self.preview_cache.remove(&image_path) {
+                self.current_image = Some(cached_protocol);
+                true
+            } else {
+                self.current_image = None;
+                false
+            };
+
+        // Don't re-prefetch items already present in the cache
+        prefetch_paths.retain(|p| !self.preview_cache.contains_key(p));
+
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        let _ = self.preview_tx.send(PreviewRequest {
+            request_id: self.preview_request_id,
+            image_path,
+            is_already_rendered,
+            prefetch_paths,
+            area: self.preview_area,
+        });
+
         let prewarm_paths = indices
             .into_iter()
             .skip(selected.saturating_sub(3))
@@ -3149,15 +3194,29 @@ impl App {
             .collect::<Vec<_>>();
         let _ = self.prewarm_tx.send(prewarm_paths);
     }
-
     fn drain_preview_updates(&mut self) {
         loop {
             match self.preview_rx.try_recv() {
                 Ok(response) => {
                     if response.request_id == self.preview_request_id {
+                        let is_current = self
+                            .current_selected_wallpaper()
+                            .map(|w| w.path == response.image_path)
+                            .unwrap_or(false);
+
                         match response.protocol {
-                            Ok(protocol) => self.current_image = Some(protocol),
-                            Err(error) => error!("terminal UI failed to load preview: {error}"),
+                            Ok(protocol) => {
+                                if is_current {
+                                    self.current_image = Some(protocol);
+                                } else {
+                                    self.preview_cache.insert(response.image_path, protocol);
+                                }
+                            }
+                            Err(error) => {
+                                if is_current {
+                                    error!("terminal UI failed to load preview: {error}");
+                                }
+                            }
                         }
                     }
                 }
@@ -3165,7 +3224,6 @@ impl App {
             }
         }
     }
-
     fn request_index_refresh(&mut self) {
         self.index_request_id = self.index_request_id.wrapping_add(1);
         let _ = self.index_tx.send(IndexRequest {
@@ -3464,22 +3522,90 @@ fn spawn_preview_worker(
     let (response_tx, response_rx) = mpsc::channel::<PreviewResponse>();
 
     thread::spawn(move || {
-        while let Ok(mut request) = request_rx.recv() {
-            while let Ok(next_request) = request_rx.try_recv() {
-                request = next_request;
+        let mut pending_request: Option<PreviewRequest> = None;
+
+        loop {
+            let mut request = match pending_request.take() {
+                Some(req) => req,
+                None => match request_rx.recv() {
+                    Ok(req) => req,
+                    Err(_) => break, // Channel closed on shutdown
+                },
+            };
+
+            // Drain any skipped requests
+            while let Ok(next_req) = request_rx.try_recv() {
+                request = next_req;
             }
 
-            let protocol = build_preview_protocol(picker, thumbnail_cache.as_ref(), &request);
-            let _ = response_tx.send(PreviewResponse {
-                request_id: request.request_id,
-                protocol,
-            });
+            // 1. If not already displayed from cache, render the primary image
+            if !request.is_already_rendered {
+                // Quick thumbnail pass if cache exists
+                if let Some(ref cache) = thumbnail_cache {
+                    if let Ok(thumb_path) =
+                        cache.generate_thumbnail(&request.image_path, ThumbnailProfile::TuiPreview)
+                    {
+                        if let Ok(thumb_img) = image::open(&thumb_path) {
+                            let mut protocol = picker.new_resize_protocol(thumb_img);
+                            protocol.resize_encode(&Resize::Scale(None), request.area);
+                            let _ = response_tx.send(PreviewResponse {
+                                request_id: request.request_id,
+                                image_path: request.image_path.clone(),
+                                protocol: Ok(protocol),
+                            });
+                        }
+                    }
+                }
+
+                if let Ok(next_req) = request_rx.try_recv() {
+                    pending_request = Some(next_req);
+                    continue;
+                }
+
+                // Full-resolution master decode
+                match image::open(&request.image_path) {
+                    Ok(full_img) => {
+                        let mut protocol = picker.new_resize_protocol(full_img);
+                        protocol.resize_encode(&Resize::Scale(None), request.area);
+                        let _ = response_tx.send(PreviewResponse {
+                            request_id: request.request_id,
+                            image_path: request.image_path.clone(),
+                            protocol: Ok(protocol),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = response_tx.send(PreviewResponse {
+                            request_id: request.request_id,
+                            image_path: request.image_path.clone(),
+                            protocol: Err(err.into()),
+                        });
+                    }
+                }
+            }
+
+            // 2. Prefetch adjacent neighbors directly in full resolution
+            for prefetch_path in request.prefetch_paths {
+                // If a new key was pressed, stop prefetching immediately
+                if let Ok(next_req) = request_rx.try_recv() {
+                    pending_request = Some(next_req);
+                    break;
+                }
+
+                if let Ok(full_img) = image::open(&prefetch_path) {
+                    let mut protocol = picker.new_resize_protocol(full_img);
+                    protocol.resize_encode(&Resize::Scale(None), request.area);
+                    let _ = response_tx.send(PreviewResponse {
+                        request_id: request.request_id,
+                        image_path: prefetch_path,
+                        protocol: Ok(protocol),
+                    });
+                }
+            }
         }
     });
 
     (request_tx, response_rx)
 }
-
 fn spawn_prewarm_worker(thumbnail_cache: Option<ThumbnailCache>) -> Sender<Vec<PathBuf>> {
     let (request_tx, request_rx) = mpsc::channel::<Vec<PathBuf>>();
 
@@ -3504,17 +3630,11 @@ fn spawn_prewarm_worker(thumbnail_cache: Option<ThumbnailCache>) -> Sender<Vec<P
 
 fn build_preview_protocol(
     picker: Picker,
-    thumbnail_cache: Option<&ThumbnailCache>,
+    _thumbnail_cache: Option<&ThumbnailCache>,
     request: &PreviewRequest,
 ) -> anyhow::Result<StatefulProtocol> {
-    let preview_path = thumbnail_cache
-        .and_then(|cache| {
-            cache
-                .generate_thumbnail(&request.image_path, ThumbnailProfile::TuiPreview)
-                .ok()
-        })
-        .unwrap_or_else(|| request.image_path.clone());
-    let dyn_img = image::open(preview_path)?;
+    // Open the original image directly for maximum sharpness
+    let dyn_img = image::open(&request.image_path)?;
     let mut protocol = picker.new_resize_protocol(dyn_img);
     protocol.resize_encode(&Resize::Scale(None), request.area);
     Ok(protocol)

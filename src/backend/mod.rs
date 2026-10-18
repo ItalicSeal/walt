@@ -17,7 +17,7 @@ pub use random::{apply_random_plan, plan_random_assignments, RandomMode, RandomP
 pub use rotation::{
     disable_rotation_service, enable_rotation_service, format_rotation_service_status,
     get_rotation_service_status, install_rotation_service, restart_rotation_service_if_active,
-    rotation_service_badge, rotation_service_status, run_rotation_daemon,
+    rotate_now, rotation_service_badge, rotation_service_status, run_rotation_daemon,
     uninstall_rotation_service, RotationServiceStatus,
 };
 pub use scanner::{scan_directory, scan_wallpapers_from_paths};
